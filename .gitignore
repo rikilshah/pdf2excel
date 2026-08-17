@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.pdf2excel_mappings.json
+*_converted.xlsx
+build/
+dist/
+build_final/
+dist_final/
+tmp/
+tesseract-ocr-w64-setup-*.exe
+vendor/
+*.spec.bak
