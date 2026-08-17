@@ -124,11 +124,18 @@ def _extract_ocr(pdf_path: Path, password: str | None = None) -> tuple[list[Extr
         pytesseract.get_tesseract_version()
     except Exception as exc:
         raise RuntimeError("OCR requires Tesseract. Install it or place a portable 'tesseract' folder beside the application executable.") from exc
+    document = pdfium.PdfDocument(str(pdf_path), password=password)
+    first_image = document[0].render(scale=300 / 72).to_pil()
+    rules = _detect_vertical_rules(first_image)
+    if len(rules) >= 3:
+        tables, warnings = _extract_ruled_ocr(document, first_image, rules, pytesseract)
+        if tables and sum(len(t.rows) for t in tables):
+            warnings.insert(0, "PDF appears to be scanned. Ruled-table OCR was used; verify all extracted data carefully.")
+            return tables, warnings
     warnings = ["PDF appears to be scanned. OCR extraction was used; verify all extracted data carefully."]
     tables: list[ExtractedTable] = []
-    document = pdfium.PdfDocument(str(pdf_path), password=password)
     for page_no, page in enumerate(document, 1):
-        image = page.render(scale=300 / 72).to_pil()
+        image = first_image if page_no == 1 else page.render(scale=300 / 72).to_pil()
         data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, config="--psm 6")
         lines: dict[tuple[int, int, int], list[tuple[int, str]]] = {}
         for i, text in enumerate(data["text"]):
@@ -146,6 +153,221 @@ def _extract_ocr(pdf_path: Path, password: str | None = None) -> tuple[list[Extr
             warnings.append(f"Page {page_no}: OCR found no usable rows.")
         image.close()
     return tables, warnings
+
+
+def _configure_tesseract(pytesseract) -> None:
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    candidates = [
+        bundle_root / "tesseract" / "tesseract.exe",
+        Path(sys.executable).parent / "tesseract" / "tesseract.exe",
+        Path(__file__).resolve().parents[1] / "vendor" / "tesseract" / "tesseract.exe",
+    ]
+    bundled = next((path for path in candidates if path.is_file()), None)
+    if bundled:
+        pytesseract.pytesseract.tesseract_cmd = str(bundled)
+        tessdata = bundled.parent / "tessdata"
+        if tessdata.is_dir():
+            os.environ["TESSDATA_PREFIX"] = str(tessdata)
+    try:
+        pytesseract.get_tesseract_version()
+    except Exception as exc:
+        raise RuntimeError("OCR requires Tesseract, but the bundled runtime could not be started.") from exc
+
+
+def _clusters(points: list[int], gap: int = 4) -> list[int]:
+    groups: list[list[int]] = []
+    for point in points:
+        if not groups or point - groups[-1][-1] > gap:
+            groups.append([point])
+        else:
+            groups[-1].append(point)
+    return [round(sum(group) / len(group)) for group in groups]
+
+
+def _longest_true_run(values) -> int:
+    best = current = 0
+    for value in values:
+        current = current + 1 if value else 0
+        best = max(best, current)
+    return best
+
+
+def _detect_vertical_rules(image) -> list[int]:
+    """Find long vertical table rules on the first statement page."""
+    import numpy as np
+
+    gray = np.asarray(image.convert("L"))
+    dark = gray < 190
+    height, width = dark.shape
+    top, bottom = int(height * 0.20), int(height * 0.90)
+    minimum = int(height * 0.12)
+    # Search a narrow horizontal band per x so anti-aliased rules are not missed.
+    candidates = [x for x in range(width)
+                  if _longest_true_run(dark[top:bottom, max(0, x - 2):min(width, x + 3)].any(axis=1)) >= minimum]
+    rules = _clusters(candidates)
+    # Ignore short box decorations; a transaction table spans most of the page.
+    if len(rules) >= 3:
+        span_groups: list[list[int]] = []
+        for point in rules:
+            if not span_groups:
+                span_groups.append([point])
+            elif point - span_groups[-1][-1] < width * 0.38:
+                span_groups[-1].append(point)
+            else:
+                span_groups.append([point])
+        rules = max(span_groups, key=lambda group: (len(group), group[-1] - group[0]))
+        if rules and rules[-1] < width * 0.96:
+            rules.append(width - 1)
+    return rules
+
+
+def _table_vertical_span(image, rules: list[int]) -> tuple[int, int] | None:
+    import numpy as np
+
+    gray = np.asarray(image.convert("L"))
+    dark = gray < 205
+    height, width = dark.shape
+    valid = []
+    for y in range(int(height * 0.18), int(height * 0.92)):
+        hits = sum(bool(dark[y, max(0, x - 2):min(width, x + 3)].any()) for x in rules)
+        valid.append(hits >= max(3, round(len(rules) * 0.65)))
+    runs: list[tuple[int, int]] = []
+    start = None
+    offset = int(height * 0.18)
+    for index, value in enumerate(valid + [False]):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            if index - start >= 25:
+                runs.append((start + offset, index - 1 + offset))
+            start = None
+    return max(runs, key=lambda run: run[1] - run[0]) if runs else None
+
+
+def _extract_ruled_ocr(document, first_image, rules: list[int], pytesseract) -> tuple[list[ExtractedTable], list[str]]:
+    tables: list[ExtractedTable] = []
+    warnings: list[str] = []
+    canonical_headers: list[str] | None = None
+    for page_no, page in enumerate(document, 1):
+        image = first_image if page_no == 1 else page.render(scale=300 / 72).to_pil()
+        # Scale the first-page rules if a page has a slightly different bitmap width.
+        scaled_rules = [round(x * image.width / first_image.width) for x in rules]
+        span = _table_vertical_span(image, scaled_rules)
+        if not span:
+            warnings.append(f"Page {page_no}: ruled table boundaries could not be isolated.")
+            if page_no != 1:
+                image.close()
+            continue
+        top, bottom = span
+        headers, rows = _ocr_rows_by_rules(image, scaled_rules, (top, bottom), pytesseract, canonical_headers)
+        if headers and headers != [f"Column {i + 1}" for i in range(len(scaled_rules) - 1)]:
+            canonical_headers = headers
+        if rows:
+            tables.append(ExtractedTable(page_no, 1, headers, rows, method="ocr-ruled"))
+        else:
+            warnings.append(f"Page {page_no}: ruled-table OCR found no dated transaction rows.")
+        if page_no != 1:
+            image.close()
+    first_image.close()
+    if canonical_headers:
+        for table in tables:
+            if len(table.headers) == len(canonical_headers):
+                table.headers = canonical_headers[:]
+    return tables, warnings
+
+
+def _ocr_rows_by_rules(image, rules: list[int], span: tuple[int, int], pytesseract,
+                       canonical_headers: list[str] | None = None) -> tuple[list[str], list[list[str]]]:
+        date_pattern = re.compile(r"^\d{2}[/.-]\d{2}[/.-]\d{2,4}$")
+        top, bottom = span
+        crop = image.crop((rules[0], top, rules[-1], bottom))
+        data = pytesseract.image_to_data(crop, output_type=pytesseract.Output.DICT, config="--psm 6")
+        lines: dict[tuple[int, int, int], list[tuple[int, int, str]]] = {}
+        for i, raw_text in enumerate(data["text"]):
+            text = _clean(raw_text)
+            if not text or int(float(data["conf"][i])) < 20:
+                continue
+            center_x = rules[0] + int(data["left"][i]) + int(data["width"][i]) // 2
+            center_y = top + int(data["top"][i]) + int(data["height"][i]) // 2
+            column = next((j for j in range(len(rules) - 1) if rules[j] <= center_x < rules[j + 1]), None)
+            if column is not None:
+                key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+                lines.setdefault(key, []).append((center_y, column, text))
+        line_cells: list[tuple[int, list[str]]] = []
+        for words in lines.values():
+            cells = [""] * (len(rules) - 1)
+            for _, column, text in sorted(words, key=lambda item: (item[1], item[0])):
+                cells[column] = (cells[column] + " " + text).strip()
+            line_cells.append((round(sum(w[0] for w in words) / len(words)), cells))
+        line_cells.sort(key=lambda item: item[0])
+        header_index = next((i for i, (_, cells) in enumerate(line_cells)
+                             if sum(any(term in cell.lower() for term in ("date", "narration", "withdraw", "deposit", "closing")) for cell in cells) >= 2), None)
+        if header_index is not None:
+            detected = line_cells[header_index][1]
+            headers = _unique_headers(detected, len(detected))
+            line_cells = line_cells[header_index + 1:]
+        else:
+            headers = canonical_headers or [f"Column {i + 1}" for i in range(len(rules) - 1)]
+        rows: list[list[str]] = []
+        for _, cells in line_cells:
+            first = cells[0].replace(" ", "")
+            if date_pattern.match(first):
+                cells[0] = first
+                rows.append(cells)
+            elif rows:
+                for column, value in enumerate(cells):
+                    if value:
+                        rows[-1][column] = (rows[-1][column] + " " + value).strip()
+        crop.close()
+        return headers, rows
+
+
+def extract_selected_ocr(pdf_path: Path, box: tuple[float, float, float, float],
+                         boundaries: list[float], page_index: int = 0, all_pages: bool = False,
+                         password: str | None = None) -> ExtractionResult:
+    """OCR only a user-selected normalized page rectangle using explicit column boundaries."""
+    _check_password(pdf_path, password)
+    if len(boundaries) < 2 or any(not 0 <= value <= 1 for value in boundaries):
+        raise ValueError("At least two valid column boundaries are required.")
+    left, top, right, bottom = box
+    if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
+        raise ValueError("The selected table area is invalid.")
+    try:
+        import pytesseract
+        import pypdfium2 as pdfium
+    except ImportError as exc:
+        raise RuntimeError("OCR support is not installed.") from exc
+    # Configure bundled Tesseract through the same validated path as automatic OCR.
+    _configure_tesseract(pytesseract)
+    document = pdfium.PdfDocument(str(pdf_path), password=password)
+    indexes = range(len(document)) if all_pages else [page_index]
+    tables: list[ExtractedTable] = []
+    warnings = ["User-guided region OCR was used; verify extracted values carefully."]
+    canonical_headers: list[str] | None = None
+    for index in indexes:
+        if index < 0 or index >= len(document):
+            raise ValueError("Selected page is outside the PDF page range.")
+        image = document[index].render(scale=300 / 72).to_pil()
+        x_rules = sorted(set(round(value * image.width) for value in boundaries))
+        selected_span = (round(top * image.height), round(bottom * image.height))
+        # When applying guides across pages, retain user-defined columns but let
+        # the visible vertical rules determine each page's table height.
+        y_span = (_table_vertical_span(image, x_rules) or selected_span) if all_pages else selected_span
+        headers, rows = _ocr_rows_by_rules(image, x_rules, y_span, pytesseract, canonical_headers)
+        if canonical_headers is None or not all(h.startswith("Column ") for h in headers):
+            canonical_headers = headers
+        if rows:
+            tables.append(ExtractedTable(index + 1, 1, headers, rows, method="ocr-user-guided"))
+        else:
+            warnings.append(f"Page {index + 1}: no dated rows found inside the selected area.")
+        image.close()
+    if not tables:
+        raise RuntimeError("No transaction rows were recognized inside the selected area. Adjust the box or column guides and try again.")
+    if canonical_headers:
+        for table in tables:
+            if len(table.headers) == len(canonical_headers):
+                table.headers = canonical_headers[:]
+    return _result_from_tables(tables, warnings, used_ocr=True)
 
 
 def extract_pdf(pdf_path: Path, allow_ocr: bool = True, mode: str = "auto", password: str | None = None) -> ExtractionResult:
@@ -168,6 +390,10 @@ def extract_pdf(pdf_path: Path, allow_ocr: bool = True, mode: str = "auto", pass
         detail = " PDF appears image-based; OCR is required." if text_pages == 0 else " The table structure may be unsupported."
         raise RuntimeError("Unable to extract tables from the PDF." + detail)
 
+    return _result_from_tables(tables, warnings, used_ocr)
+
+
+def _result_from_tables(tables: list[ExtractedTable], warnings: list[str], used_ocr: bool) -> ExtractionResult:
     # Use the most frequent header structure as canonical. Incompatible tables are retained via positional names and warned.
     signatures = Counter(tuple(t.headers) for t in tables)
     canonical = list(signatures.most_common(1)[0][0])

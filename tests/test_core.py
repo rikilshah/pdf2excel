@@ -9,7 +9,8 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
 from pypdf import PdfReader, PdfWriter
 
 from pdf2excel.export import export_xlsx
-from pdf2excel.extraction import InvalidPasswordError, PasswordRequiredError, extract_pdf
+from pdf2excel.extraction import InvalidPasswordError, PasswordRequiredError, extract_pdf, extract_selected_ocr
+from pdf2excel.gui import DataModel
 from pdf2excel.corrections import apply_instruction
 from pdf2excel.mapping import MappingStore, apply_mapping, suggest_mapping
 from pdf2excel.models import ExtractionResult, ExtractedTable, MappingSpec
@@ -120,3 +121,17 @@ def test_bundled_ocr_dependencies_process_scanned_pdf(tmp_path: Path):
     result = extract_pdf(scanned, mode="ocr")
     assert result.used_ocr and result.rows
     assert "INV001" in " ".join(result.rows[0].values())
+
+
+def test_user_guided_region_ocr_and_editable_headers(tmp_path: Path):
+    image = Image.new("RGB", (1600, 700), "white")
+    draw = ImageDraw.Draw(image); font = ImageFont.truetype("arial.ttf", 64)
+    draw.text((80, 80), "Date Narration Amount", fill="black", font=font)
+    draw.text((80, 260), "01/03/26", fill="black", font=font)
+    draw.text((480, 260), "Interest credit", fill="black", font=font)
+    draw.text((1250, 260), "126.00", fill="black", font=font)
+    scanned = tmp_path / "guided.pdf"; image.save(scanned, "PDF", resolution=300)
+    result = extract_selected_ocr(scanned, (0, 0, 1, 0.8), [0, 0.25, 0.75, 1], all_pages=False)
+    assert result.rows and result.rows[0][result.columns[0]] == "01/03/26"
+    model = DataModel(); model.replace(result.columns, result.rows); model.rename_column(0, "Transaction Date")
+    assert model.columns[0] == "Transaction Date" and model.rows[0]["Transaction Date"] == "01/03/26"

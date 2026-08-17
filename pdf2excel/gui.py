@@ -4,17 +4,17 @@ import json
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QSettings, Qt, QThread, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QPointF, QRectF, QSettings, Qt, QThread, Signal
+from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QInputDialog, QLineEdit as QtLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSplitter, QStatusBar,
-    QTableView, QTableWidget, QTableWidgetItem, QTextEdit, QToolBar, QVBoxLayout, QWidget,
+    QTableView, QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QToolBar, QVBoxLayout, QWidget,
 )
 
 from .corrections import CorrectionError, apply_instruction
-from .extraction import InvalidPasswordError, PasswordRequiredError, extract_pdf
+from .extraction import InvalidPasswordError, PasswordRequiredError, extract_pdf, extract_selected_ocr
 from .mapping import MappingSpec, apply_mapping, suggest_mapping
 from .models import ExtractionResult
 from .tabular import export_data, read_excel_headers
@@ -77,6 +77,21 @@ class DataModel(QAbstractTableModel):
         self.endResetModel()
         self.changed.emit()
 
+    def rename_column(self, section: int, new_name: str) -> None:
+        if section < 0 or section >= len(self.columns):
+            return
+        new_name = new_name.strip()
+        old_name = self.columns[section]
+        if not new_name or (new_name != old_name and new_name in self.columns):
+            raise ValueError("Column names must be nonblank and unique.")
+        if new_name == old_name:
+            return
+        self.columns[section] = new_name
+        for row in self.rows:
+            row[new_name] = row.pop(old_name, "")
+        self.headerDataChanged.emit(Qt.Horizontal, section, section)
+        self.changed.emit()
+
 
 class ExtractWorker(QObject):
     finished = Signal(object)
@@ -96,6 +111,153 @@ class ExtractWorker(QObject):
             self.password_required.emit("invalid")
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class GuidedOcrWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+    password_required = Signal(str)
+
+    def __init__(self, path: Path, box, boundaries, page_index, all_pages, password):
+        super().__init__()
+        self.args = path, box, boundaries, page_index, all_pages, password
+
+    def run(self):
+        try:
+            self.finished.emit(extract_selected_ocr(*self.args))
+        except PasswordRequiredError:
+            self.password_required.emit("required")
+        except InvalidPasswordError:
+            self.password_required.emit("invalid")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class SelectionCanvas(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(640, 460)
+        self.setMouseTracking(True)
+        self.image = QImage()
+        self.selection: QRectF | None = None
+        self.dividers: list[float] = []
+        self.mode = "area"
+        self._drag_start: QPointF | None = None
+
+    def set_image(self, image: QImage):
+        self.image = image
+        self.selection = None; self.dividers = []
+        self.update()
+
+    def _target(self) -> QRectF:
+        if self.image.isNull():
+            return QRectF()
+        scale = min(self.width() / self.image.width(), self.height() / self.image.height())
+        width, height = self.image.width() * scale, self.image.height() * scale
+        return QRectF((self.width() - width) / 2, (self.height() - height) / 2, width, height)
+
+    def _to_image(self, point: QPointF) -> QPointF | None:
+        target = self._target()
+        if not target.contains(point):
+            return None
+        return QPointF((point.x() - target.left()) * self.image.width() / target.width(),
+                       (point.y() - target.top()) * self.image.height() / target.height())
+
+    def paintEvent(self, event):
+        painter = QPainter(self); painter.fillRect(self.rect(), QColor("#283142"))
+        target = self._target()
+        if self.image.isNull():
+            painter.setPen(QColor("#cbd5e1")); painter.drawText(self.rect(), Qt.AlignCenter, "Open a PDF to preview pages")
+            return
+        painter.drawImage(target, self.image)
+        if self.selection:
+            sx = target.left() + self.selection.left() * target.width() / self.image.width()
+            sy = target.top() + self.selection.top() * target.height() / self.image.height()
+            sw = self.selection.width() * target.width() / self.image.width()
+            sh = self.selection.height() * target.height() / self.image.height()
+            shown = QRectF(sx, sy, sw, sh)
+            painter.fillRect(shown, QColor(49, 95, 203, 35)); painter.setPen(QPen(QColor("#315fcb"), 2)); painter.drawRect(shown)
+            painter.setPen(QPen(QColor("#ef4444"), 2))
+            for x in self.dividers:
+                px = target.left() + x * target.width() / self.image.width()
+                painter.drawLine(round(px), round(shown.top()), round(px), round(shown.bottom()))
+
+    def mousePressEvent(self, event):
+        point = self._to_image(event.position())
+        if point is None:
+            return
+        if self.mode == "divider" and self.selection and self.selection.left() < point.x() < self.selection.right():
+            self.dividers.append(point.x()); self.dividers = sorted(set(self.dividers)); self.update(); return
+        self.mode = "area"; self._drag_start = point; self.selection = QRectF(point, point); self.dividers = []; self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_start is None:
+            return
+        point = self._to_image(event.position())
+        if point:
+            self.selection = QRectF(self._drag_start, point).normalized(); self.update()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start = None
+
+    def geometry(self):
+        if not self.selection or self.selection.width() < 10 or self.selection.height() < 10:
+            raise ValueError("Drag a table rectangle first.")
+        boundaries = [self.selection.left(), *self.dividers, self.selection.right()]
+        if len(boundaries) < 3:
+            raise ValueError("Add at least one column divider inside the selected table.")
+        box = (self.selection.left() / self.image.width(), self.selection.top() / self.image.height(),
+               self.selection.right() / self.image.width(), self.selection.bottom() / self.image.height())
+        return box, [x / self.image.width() for x in boundaries]
+
+
+class PdfSelectionPanel(QWidget):
+    run_requested = Signal(object, object, int, bool)
+
+    def __init__(self):
+        super().__init__(); self.path = None; self.password = None; self.document = None; self.page_index = 0
+        root = QVBoxLayout(self)
+        controls = QHBoxLayout()
+        self.prev = QPushButton("Previous page"); self.next = QPushButton("Next page"); self.page_label = QLabel("No PDF loaded")
+        area = QPushButton("1. Draw table area"); divider = QPushButton("2. Add column divider"); undo = QPushButton("Undo divider")
+        self.all_pages = QCheckBox("Apply column layout to all pages"); self.all_pages.setChecked(True)
+        run = QPushButton("3. Run OCR on selection"); run.setObjectName("primary")
+        controls.addWidget(self.prev); controls.addWidget(self.next); controls.addWidget(self.page_label); controls.addStretch()
+        controls.addWidget(area); controls.addWidget(divider); controls.addWidget(undo); controls.addWidget(self.all_pages); controls.addWidget(run)
+        self.canvas = SelectionCanvas(); root.addLayout(controls); root.addWidget(self.canvas, 1)
+        tip = QLabel("Drag around the table, then click Add column divider and click each boundary between columns. Red guides show the OCR columns.")
+        tip.setObjectName("muted"); root.addWidget(tip)
+        self.prev.clicked.connect(lambda: self.show_page(self.page_index - 1)); self.next.clicked.connect(lambda: self.show_page(self.page_index + 1))
+        area.clicked.connect(lambda: setattr(self.canvas, "mode", "area")); divider.clicked.connect(lambda: setattr(self.canvas, "mode", "divider"))
+        undo.clicked.connect(self.undo_divider); run.clicked.connect(self.run_selection)
+
+    def load_pdf(self, path: Path, password: str | None):
+        import pypdfium2 as pdfium
+        self.path, self.password = path, password
+        self.document = pdfium.PdfDocument(str(path), password=password)
+        self.show_page(0)
+
+    def show_page(self, index: int):
+        if not self.document or index < 0 or index >= len(self.document):
+            return
+        self.page_index = index
+        pil = self.document[index].render(scale=1.7).to_pil().convert("RGBA")
+        raw = pil.tobytes("raw", "RGBA")
+        image = QImage(raw, pil.width, pil.height, pil.width * 4, QImage.Format_RGBA8888).copy()
+        pil.close(); self.canvas.set_image(image)
+        self.page_label.setText(f"Page {index + 1} of {len(self.document)}")
+        self.prev.setEnabled(index > 0); self.next.setEnabled(index + 1 < len(self.document))
+
+    def undo_divider(self):
+        if self.canvas.dividers:
+            self.canvas.dividers.pop(); self.canvas.update()
+
+    def run_selection(self):
+        try:
+            box, boundaries = self.canvas.geometry()
+            self.run_requested.emit(box, boundaries, self.page_index, self.all_pages.isChecked())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Selection incomplete", str(exc))
 
 
 class MappingDialog(QDialog):
@@ -160,6 +322,8 @@ class MainWindow(QMainWindow):
         self.model.changed.connect(self.refresh_summary)
         self._thread: QThread | None = None
         self._retry_after_password = False
+        self._retry_guided = False
+        self._guided_args = None
         self._build_ui()
         self._apply_style()
 
@@ -189,6 +353,7 @@ class MainWindow(QMainWindow):
         self.table = QTableView(); self.table.setModel(self.model); self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableView.SelectItems); self.table.setSelectionMode(QTableView.ExtendedSelection)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive); self.table.horizontalHeader().setDefaultSectionSize(150)
+        self.table.horizontalHeader().sectionDoubleClicked.connect(self.rename_header)
         self.table.verticalHeader().setDefaultSectionSize(28)
         table_layout.addLayout(table_head); table_layout.addWidget(self.table)
 
@@ -204,7 +369,10 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(correction_title); side_layout.addWidget(help_text); side_layout.addWidget(self.instruction); side_layout.addWidget(apply_btn)
         side_layout.addSpacing(12); side_layout.addWidget(warning_title); side_layout.addWidget(self.report, 1)
         splitter.addWidget(table_panel); splitter.addWidget(side); splitter.setStretchFactor(0, 1); splitter.setSizes([900, 340])
-        outer.addWidget(splitter, 1)
+        workspace = QWidget(); workspace_layout = QVBoxLayout(workspace); workspace_layout.setContentsMargins(0, 0, 0, 0); workspace_layout.addWidget(splitter)
+        self.viewer = PdfSelectionPanel(); self.viewer.run_requested.connect(self.start_guided_ocr)
+        self.tabs = QTabWidget(); self.tabs.addTab(self.viewer, "PDF viewer & column selection"); self.tabs.addTab(workspace, "Extracted data")
+        outer.addWidget(self.tabs, 1)
 
         self.progress = QProgressBar(); self.progress.setRange(0, 0); self.progress.hide(); outer.addWidget(self.progress)
         self.setCentralWidget(central); self.setStatusBar(QStatusBar())
@@ -233,7 +401,12 @@ class MainWindow(QMainWindow):
         name, _ = QFileDialog.getOpenFileName(self, "Open PDF", start, "PDF documents (*.pdf)")
         if not name:
             return
-        self.pdf_path = Path(name); self._pdf_password = None; self.settings.setValue("lastFolder", str(self.pdf_path.parent)); self.start_extraction()
+        self.pdf_path = Path(name); self._pdf_password = None; self.settings.setValue("lastFolder", str(self.pdf_path.parent))
+        try:
+            self.viewer.load_pdf(self.pdf_path, None); self.tabs.setCurrentWidget(self.viewer)
+        except Exception:
+            pass  # Encrypted PDFs are loaded after the secure password prompt succeeds.
+        self.start_extraction()
 
     def start_extraction(self):
         if not self.pdf_path or self._thread:
@@ -251,12 +424,21 @@ class MainWindow(QMainWindow):
         self._thread = None; self.progress.hide(); self.reextract.setEnabled(bool(self.pdf_path))
         if self._retry_after_password:
             self._retry_after_password = False
-            self.start_extraction()
+            if self._retry_guided and self._guided_args:
+                self._retry_guided = False; self.start_guided_ocr(*self._guided_args)
+            else:
+                self.start_extraction()
 
     def extraction_done(self, result: ExtractionResult):
         self.extraction = result; self.model.replace(result.columns, result.rows)
         self.subtitle.setText(str(self.pdf_path)); self.statusBar().showMessage("Extraction complete. Review highlighted blanks and warnings.", 6000)
         self.refresh_report()
+        try:
+            if self.viewer.document is None and self.pdf_path:
+                self.viewer.load_pdf(self.pdf_path, self._pdf_password)
+        except Exception:
+            pass
+        self.tabs.setCurrentIndex(1)
 
     def extraction_failed(self, message: str):
         QMessageBox.critical(self, "Extraction failed", message); self.statusBar().showMessage("Extraction failed", 5000)
@@ -270,6 +452,32 @@ class MainWindow(QMainWindow):
             self._retry_after_password = True
         else:
             self.statusBar().showMessage("Password entry cancelled; no data was extracted.", 5000)
+
+    def start_guided_ocr(self, box, boundaries, page_index: int, all_pages: bool):
+        if not self.pdf_path or self._thread:
+            return
+        self._guided_args = (box, boundaries, page_index, all_pages)
+        self.progress.show(); self.reextract.setEnabled(False); self.statusBar().showMessage("Running OCR inside the selected table area…")
+        thread = QThread(self)
+        worker = GuidedOcrWorker(self.pdf_path, box, boundaries, page_index, all_pages, self._pdf_password)
+        worker.moveToThread(thread); thread.started.connect(worker.run)
+        worker.finished.connect(self.extraction_done); worker.failed.connect(self.extraction_failed); worker.password_required.connect(self._guided_password)
+        worker.finished.connect(thread.quit); worker.failed.connect(thread.quit); worker.password_required.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater); thread.finished.connect(thread.deleteLater); thread.finished.connect(self._thread_finished)
+        self._thread = thread; self._worker = worker; thread.start()
+
+    def _guided_password(self, reason: str):
+        self._retry_guided = True
+        self.request_pdf_password(reason)
+
+    def rename_header(self, section: int):
+        old = self.model.columns[section]
+        name, accepted = QInputDialog.getText(self, "Rename column", "Column name:", text=old)
+        if accepted:
+            try:
+                self.model.rename_column(section, name); self.refresh_report()
+            except ValueError as exc:
+                QMessageBox.warning(self, "Cannot rename column", str(exc))
 
     def refresh_summary(self):
         self.summary.setText(f"{len(self.model.rows):,} rows  •  {len(self.model.columns)} columns")

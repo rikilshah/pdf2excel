@@ -8,6 +8,8 @@ build/
 dist/
 build_final/
 dist_final/
+build_release_*/
+dist_release_*/
 tmp/
 tesseract-ocr-w64-setup-*.exe
 vendor/
