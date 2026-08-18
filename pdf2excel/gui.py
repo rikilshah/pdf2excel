@@ -4,13 +4,13 @@ import json
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QPointF, QRectF, QSettings, Qt, QThread, Signal
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QPointF, QRectF, QSettings, Qt, QThread, QTime, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QInputDialog, QLineEdit as QtLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSplitter, QStatusBar,
-    QTableView, QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QToolBar, QVBoxLayout, QWidget,
+    QScrollArea, QStackedWidget, QTableView, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .corrections import CorrectionError, apply_instruction
@@ -97,6 +97,7 @@ class ExtractWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
     password_required = Signal(str)
+    progress = Signal(int, str)
 
     def __init__(self, path: Path, mode: str, password: str | None):
         super().__init__()
@@ -104,7 +105,8 @@ class ExtractWorker(QObject):
 
     def run(self):
         try:
-            self.finished.emit(extract_pdf(self.path, allow_ocr=True, mode=self.mode, password=self.password))
+            self.finished.emit(extract_pdf(self.path, allow_ocr=True, mode=self.mode, password=self.password,
+                                           progress=self.progress.emit))
         except PasswordRequiredError:
             self.password_required.emit("required")
         except InvalidPasswordError:
@@ -117,14 +119,16 @@ class GuidedOcrWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
     password_required = Signal(str)
+    progress = Signal(int, str)
 
-    def __init__(self, path: Path, box, boundaries, page_index, all_pages, password):
+    def __init__(self, path: Path, box, boundaries, page_index, all_pages, password, rotation):
         super().__init__()
         self.args = path, box, boundaries, page_index, all_pages, password
+        self.rotation = rotation
 
     def run(self):
         try:
-            self.finished.emit(extract_selected_ocr(*self.args))
+            self.finished.emit(extract_selected_ocr(*self.args, progress=self.progress.emit, rotation=self.rotation))
         except PasswordRequiredError:
             self.password_required.emit("required")
         except InvalidPasswordError:
@@ -136,18 +140,27 @@ class GuidedOcrWorker(QObject):
 class SelectionCanvas(QWidget):
     def __init__(self):
         super().__init__()
-        self.setMinimumSize(640, 460)
+        self.resize(720, 900)
         self.setMouseTracking(True)
         self.image = QImage()
         self.selection: QRectF | None = None
         self.dividers: list[float] = []
         self.mode = "area"
+        self.zoom = 0.65
         self._drag_start: QPointF | None = None
 
     def set_image(self, image: QImage):
         self.image = image
         self.selection = None; self.dividers = []
-        self.update()
+        self._resize_for_zoom(); self.update()
+
+    def set_zoom(self, zoom: float):
+        self.zoom = zoom; self._resize_for_zoom(); self.update()
+
+    def _resize_for_zoom(self):
+        if not self.image.isNull():
+            self.setFixedSize(max(320, round(self.image.width() * self.zoom)),
+                              max(420, round(self.image.height() * self.zoom)))
 
     def _target(self) -> QRectF:
         if self.image.isNull():
@@ -212,22 +225,29 @@ class SelectionCanvas(QWidget):
 
 
 class PdfSelectionPanel(QWidget):
-    run_requested = Signal(object, object, int, bool)
+    run_requested = Signal(object, object, int, bool, int)
 
     def __init__(self):
-        super().__init__(); self.path = None; self.password = None; self.document = None; self.page_index = 0
+        super().__init__(); self.path = None; self.password = None; self.document = None; self.page_index = 0; self.rotation = 0
         root = QVBoxLayout(self)
         controls = QHBoxLayout()
-        self.prev = QPushButton("Previous page"); self.next = QPushButton("Next page"); self.page_label = QLabel("No PDF loaded")
+        self.prev = QPushButton("Previous"); self.next = QPushButton("Next"); self.page_label = QLabel("No PDF loaded")
+        self.zoom = QComboBox(); self.zoom.addItems(["50%", "65%", "80%", "100%", "125%", "150%", "200%"]); self.zoom.setCurrentText("65%")
+        rotate_left = QPushButton("Rotate left"); rotate_right = QPushButton("Rotate right")
         area = QPushButton("1. Draw table area"); divider = QPushButton("2. Add column divider"); undo = QPushButton("Undo divider")
         self.all_pages = QCheckBox("Apply column layout to all pages"); self.all_pages.setChecked(True)
         run = QPushButton("3. Run OCR on selection"); run.setObjectName("primary")
-        controls.addWidget(self.prev); controls.addWidget(self.next); controls.addWidget(self.page_label); controls.addStretch()
-        controls.addWidget(area); controls.addWidget(divider); controls.addWidget(undo); controls.addWidget(self.all_pages); controls.addWidget(run)
-        self.canvas = SelectionCanvas(); root.addLayout(controls); root.addWidget(self.canvas, 1)
+        controls.addWidget(self.prev); controls.addWidget(self.next); controls.addWidget(self.page_label); controls.addSpacing(10)
+        controls.addWidget(QLabel("Zoom")); controls.addWidget(self.zoom); controls.addWidget(rotate_left); controls.addWidget(rotate_right); controls.addStretch()
+        tools = QHBoxLayout(); tools.addWidget(area); tools.addWidget(divider); tools.addWidget(undo); tools.addStretch(); tools.addWidget(self.all_pages); tools.addWidget(run)
+        self.canvas = SelectionCanvas(); self.scroll = QScrollArea(); self.scroll.setWidget(self.canvas); self.scroll.setAlignment(Qt.AlignCenter); self.scroll.setWidgetResizable(False)
+        self.scroll.setObjectName("viewerScroll")
+        root.addLayout(controls); root.addLayout(tools); root.addWidget(self.scroll, 1)
         tip = QLabel("Drag around the table, then click Add column divider and click each boundary between columns. Red guides show the OCR columns.")
         tip.setObjectName("muted"); root.addWidget(tip)
         self.prev.clicked.connect(lambda: self.show_page(self.page_index - 1)); self.next.clicked.connect(lambda: self.show_page(self.page_index + 1))
+        self.zoom.currentTextChanged.connect(lambda text: self.canvas.set_zoom(int(text.rstrip("%")) / 100))
+        rotate_left.clicked.connect(lambda: self.rotate(-90)); rotate_right.clicked.connect(lambda: self.rotate(90))
         area.clicked.connect(lambda: setattr(self.canvas, "mode", "area")); divider.clicked.connect(lambda: setattr(self.canvas, "mode", "divider"))
         undo.clicked.connect(self.undo_divider); run.clicked.connect(self.run_selection)
 
@@ -242,11 +262,19 @@ class PdfSelectionPanel(QWidget):
             return
         self.page_index = index
         pil = self.document[index].render(scale=1.7).to_pil().convert("RGBA")
+        if self.rotation:
+            pil = pil.rotate(-self.rotation, expand=True)
         raw = pil.tobytes("raw", "RGBA")
         image = QImage(raw, pil.width, pil.height, pil.width * 4, QImage.Format_RGBA8888).copy()
         pil.close(); self.canvas.set_image(image)
         self.page_label.setText(f"Page {index + 1} of {len(self.document)}")
         self.prev.setEnabled(index > 0); self.next.setEnabled(index + 1 < len(self.document))
+
+    def rotate(self, delta: int):
+        if not self.document:
+            return
+        self.rotation = (self.rotation + delta) % 360
+        self.show_page(self.page_index)
 
     def undo_divider(self):
         if self.canvas.dividers:
@@ -255,7 +283,7 @@ class PdfSelectionPanel(QWidget):
     def run_selection(self):
         try:
             box, boundaries = self.canvas.geometry()
-            self.run_requested.emit(box, boundaries, self.page_index, self.all_pages.isChecked())
+            self.run_requested.emit(box, boundaries, self.page_index, self.all_pages.isChecked(), self.rotation)
         except ValueError as exc:
             QMessageBox.warning(self, "Selection incomplete", str(exc))
 
@@ -328,22 +356,34 @@ class MainWindow(QMainWindow):
         self._apply_style()
 
     def _build_ui(self):
-        toolbar = QToolBar("Main"); toolbar.setMovable(False); toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.addToolBar(toolbar)
-        open_action = QAction("Open PDF", self); open_action.setShortcut(QKeySequence.Open); open_action.triggered.connect(self.open_pdf)
-        export_action = QAction("Export detected data", self); export_action.setShortcut(QKeySequence.Save); export_action.triggered.connect(self.export_direct)
-        map_action = QAction("Map to Excel template", self); map_action.triggered.connect(self.map_to_excel)
-        toolbar.addAction(open_action); toolbar.addSeparator(); toolbar.addAction(export_action); toolbar.addAction(map_action)
+        open_action = QAction("Open PDF", self); open_action.setShortcut(QKeySequence.Open); open_action.triggered.connect(self.open_pdf); self.addAction(open_action)
+        export_action = QAction("Export", self); export_action.setShortcut(QKeySequence.Save); export_action.triggered.connect(self.export_direct); self.addAction(export_action)
 
-        central = QWidget(); outer = QVBoxLayout(central); outer.setContentsMargins(18, 16, 18, 14); outer.setSpacing(12)
-        title_row = QHBoxLayout()
-        title_box = QVBoxLayout(); title = QLabel("PDF table workspace"); title.setObjectName("title")
-        self.subtitle = QLabel("Open a PDF to extract, review, correct, and export its tabular data."); self.subtitle.setObjectName("muted")
-        title_box.addWidget(title); title_box.addWidget(self.subtitle); title_row.addLayout(title_box, 1)
-        self.mode = QComboBox(); self.mode.addItems(["Auto detect", "Ruled tables (lines)", "Borderless tables (text)", "Force OCR"])
-        self.reextract = QPushButton("Re-extract"); self.reextract.clicked.connect(self.start_extraction); self.reextract.setEnabled(False)
-        title_row.addWidget(QLabel("Method")); title_row.addWidget(self.mode); title_row.addWidget(self.reextract)
-        outer.addLayout(title_row)
+        central = QWidget(); shell = QHBoxLayout(central); shell.setContentsMargins(0, 0, 0, 0); shell.setSpacing(0)
+        self.sidebar = QFrame(); self.sidebar.setObjectName("sidebar"); self.sidebar.setFixedWidth(252)
+        nav = QVBoxLayout(self.sidebar); nav.setContentsMargins(18, 22, 18, 18); nav.setSpacing(10)
+        brand = QLabel("PDF2EXCEL"); brand.setObjectName("brand"); product = QLabel("Document workspace"); product.setObjectName("sidebarMuted")
+        nav.addWidget(brand); nav.addWidget(product); nav.addSpacing(18)
+        open_btn = QPushButton("Open PDF"); open_btn.setObjectName("sidebarPrimary"); open_btn.clicked.connect(self.open_pdf); nav.addWidget(open_btn)
+        nav_label = QLabel("WORKSPACE"); nav_label.setObjectName("navLabel"); nav.addSpacing(10); nav.addWidget(nav_label)
+        self.pdf_nav = QPushButton("PDF viewer"); self.pdf_nav.setObjectName("navButton"); self.pdf_nav.clicked.connect(lambda: self.show_workspace(0))
+        self.data_nav = QPushButton("Extracted data"); self.data_nav.setObjectName("navButton"); self.data_nav.clicked.connect(lambda: self.show_workspace(1))
+        nav.addWidget(self.pdf_nav); nav.addWidget(self.data_nav)
+        ocr_label = QLabel("OCR"); ocr_label.setObjectName("navLabel"); nav.addSpacing(10); nav.addWidget(ocr_label)
+        self.mode = QComboBox(); self.mode.addItems(["Auto detect", "Ruled tables", "Borderless table", "Force OCR"]); nav.addWidget(self.mode)
+        self.reextract = QPushButton("Run OCR"); self.reextract.setObjectName("sidebarPrimary"); self.reextract.clicked.connect(self.start_extraction); self.reextract.setEnabled(False); nav.addWidget(self.reextract)
+        self.progress_label = QLabel("Load a PDF to begin"); self.progress_label.setWordWrap(True); self.progress_label.setObjectName("sidebarMuted"); nav.addWidget(self.progress_label)
+        self.progress = QProgressBar(); self.progress.setRange(0, 100); self.progress.setValue(0); self.progress.setTextVisible(True); nav.addWidget(self.progress)
+        self.activity = QTextEdit(); self.activity.setReadOnly(True); self.activity.setObjectName("activity"); self.activity.setMaximumHeight(150); self.activity.setPlaceholderText("OCR activity will appear here."); nav.addWidget(self.activity)
+        nav.addStretch()
+        export_btn = QPushButton("Export data"); export_btn.setObjectName("navButton"); export_btn.clicked.connect(self.export_direct)
+        map_btn = QPushButton("Map to Excel"); map_btn.setObjectName("navButton"); map_btn.clicked.connect(self.map_to_excel)
+        nav.addWidget(export_btn); nav.addWidget(map_btn)
+
+        main = QWidget(); main_layout = QVBoxLayout(main); main_layout.setContentsMargins(24, 20, 24, 18); main_layout.setSpacing(14)
+        title_row = QHBoxLayout(); title_box = QVBoxLayout(); self.page_title = QLabel("PDF viewer"); self.page_title.setObjectName("title")
+        self.subtitle = QLabel("Open a document, review its pages, then run OCR when you are ready."); self.subtitle.setObjectName("muted")
+        title_box.addWidget(self.page_title); title_box.addWidget(self.subtitle); title_row.addLayout(title_box, 1); main_layout.addLayout(title_row)
 
         splitter = QSplitter(Qt.Horizontal)
         table_panel = QFrame(); table_panel.setObjectName("panel"); table_layout = QVBoxLayout(table_panel)
@@ -371,29 +411,40 @@ class MainWindow(QMainWindow):
         splitter.addWidget(table_panel); splitter.addWidget(side); splitter.setStretchFactor(0, 1); splitter.setSizes([900, 340])
         workspace = QWidget(); workspace_layout = QVBoxLayout(workspace); workspace_layout.setContentsMargins(0, 0, 0, 0); workspace_layout.addWidget(splitter)
         self.viewer = PdfSelectionPanel(); self.viewer.run_requested.connect(self.start_guided_ocr)
-        self.tabs = QTabWidget(); self.tabs.addTab(self.viewer, "PDF viewer & column selection"); self.tabs.addTab(workspace, "Extracted data")
-        outer.addWidget(self.tabs, 1)
-
-        self.progress = QProgressBar(); self.progress.setRange(0, 0); self.progress.hide(); outer.addWidget(self.progress)
+        self.stack = QStackedWidget(); self.stack.addWidget(self.viewer); self.stack.addWidget(workspace); main_layout.addWidget(self.stack, 1)
+        shell.addWidget(self.sidebar); shell.addWidget(main, 1)
         self.setCentralWidget(central); self.setStatusBar(QStatusBar())
+        self.show_workspace(0)
 
     def _apply_style(self):
         self.setStyleSheet("""
-            QMainWindow, QWidget { background: #f5f7fb; color: #172033; font: 10pt 'Segoe UI'; }
-            QToolBar { background: #ffffff; border: 0; border-bottom: 1px solid #dfe4ec; padding: 8px 14px; spacing: 8px; }
-            QToolButton { padding: 7px 10px; border-radius: 6px; } QToolButton:hover { background: #edf2ff; }
-            QFrame#panel { background: #ffffff; border: 1px solid #dfe4ec; border-radius: 10px; }
-            QLabel#title { font-size: 20pt; font-weight: 650; color: #111827; }
-            QLabel#section { font-size: 12pt; font-weight: 650; color: #111827; }
+            QMainWindow, QWidget { background: #f4f6f9; color: #182230; font: 10pt 'Segoe UI'; }
+            QFrame#sidebar { background: #101828; border: 0; }
+            QLabel#brand { background: transparent; color: #ffffff; font-size: 16pt; font-weight: 700; letter-spacing: 1px; }
+            QLabel#sidebarMuted { background: transparent; color: #98a2b3; }
+            QLabel#navLabel { background: transparent; color: #667085; font-size: 8pt; font-weight: 700; letter-spacing: 1px; }
+            QPushButton#navButton { min-height: 38px; color: #d0d5dd; background: transparent; border: 0; border-radius: 6px; padding: 0 12px; text-align: left; font-weight: 600; }
+            QPushButton#navButton:hover { background: #1d2939; color: white; }
+            QPushButton#navButton[active="true"] { background: #344054; color: white; }
+            QPushButton#sidebarPrimary { min-height: 40px; color: white; background: #2563eb; border: 0; border-radius: 6px; padding: 0 12px; text-align: left; font-weight: 650; }
+            QPushButton#sidebarPrimary:hover { background: #1d4ed8; }
+            QPushButton#sidebarPrimary:disabled { background: #344054; color: #667085; }
+            QFrame#sidebar QComboBox { min-height: 34px; color: #f2f4f7; background: #1d2939; border: 1px solid #344054; border-radius: 6px; padding: 0 9px; }
+            QFrame#sidebar QTextEdit#activity { color: #b9c2d0; background: #0c1422; border: 1px solid #253248; border-radius: 6px; padding: 7px; font: 8.5pt 'Consolas'; }
+            QFrame#sidebar QProgressBar { min-height: 17px; max-height: 17px; color: white; background: #253248; border: 0; border-radius: 4px; text-align: center; font-size: 8pt; }
+            QFrame#sidebar QProgressBar::chunk { background: #22c55e; border-radius: 4px; }
+            QFrame#panel { background: #ffffff; border: 1px solid #dde3ec; border-radius: 8px; }
+            QLabel#title { font-size: 19pt; font-weight: 650; color: #101828; }
+            QLabel#section { font-size: 11.5pt; font-weight: 650; color: #101828; }
             QLabel#muted { color: #667085; }
-            QPushButton, QComboBox, QLineEdit { min-height: 32px; border: 1px solid #cfd6e4; border-radius: 7px; padding: 0 10px; background: #ffffff; }
-            QPushButton:hover { border-color: #7395e5; background: #f5f8ff; }
-            QPushButton#primary { color: white; background: #315fcb; border-color: #315fcb; font-weight: 600; }
-            QPushButton#primary:hover { background: #264fac; }
-            QTableView, QTableWidget, QListWidget, QTextEdit { background: white; border: 1px solid #dfe4ec; border-radius: 6px; gridline-color: #e8ecf2; alternate-background-color: #f8faff; }
-            QHeaderView::section { background: #edf2f8; color: #344054; padding: 7px; border: 0; border-right: 1px solid #dfe4ec; border-bottom: 1px solid #dfe4ec; font-weight: 600; }
-            QStatusBar { background: #ffffff; border-top: 1px solid #dfe4ec; }
-            QProgressBar { border: 0; background: #e9edf5; height: 5px; } QProgressBar::chunk { background: #315fcb; }
+            QPushButton, QComboBox, QLineEdit { min-height: 34px; border: 1px solid #cfd7e3; border-radius: 6px; padding: 0 10px; background: #ffffff; }
+            QPushButton:hover { border-color: #7aa2ef; background: #f7f9fd; }
+            QPushButton#primary { color: white; background: #2563eb; border-color: #2563eb; font-weight: 650; }
+            QPushButton#primary:hover { background: #1d4ed8; }
+            QScrollArea#viewerScroll { background: #202938; border: 1px solid #344054; border-radius: 6px; }
+            QTableView, QTableWidget, QListWidget, QTextEdit { background: white; border: 1px solid #dce2ea; border-radius: 5px; gridline-color: #e8ecf2; alternate-background-color: #f8fafc; }
+            QHeaderView::section { background: #eef2f7; color: #344054; padding: 8px; border: 0; border-right: 1px solid #dce2ea; border-bottom: 1px solid #dce2ea; font-weight: 650; }
+            QStatusBar { background: #ffffff; border-top: 1px solid #dce2ea; color: #475467; }
         """)
 
     def open_pdf(self):
@@ -403,25 +454,39 @@ class MainWindow(QMainWindow):
             return
         self.pdf_path = Path(name); self._pdf_password = None; self.settings.setValue("lastFolder", str(self.pdf_path.parent))
         try:
-            self.viewer.load_pdf(self.pdf_path, None); self.tabs.setCurrentWidget(self.viewer)
-        except Exception:
-            pass  # Encrypted PDFs are loaded after the secure password prompt succeeds.
-        self.start_extraction()
+            from pypdf import PdfReader
+            reader = PdfReader(self.pdf_path)
+            while reader.is_encrypted:
+                password, accepted = QInputDialog.getText(self, "Password required", "This PDF is protected. Enter its password:", QtLineEdit.Password)
+                if not accepted:
+                    self.pdf_path = None; return
+                if reader.decrypt(password):
+                    self._pdf_password = password; break
+                QMessageBox.warning(self, "Incorrect password", "The password was incorrect. Please try again.")
+            self.viewer.load_pdf(self.pdf_path, self._pdf_password)
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot open PDF", str(exc)); self.pdf_path = None; return
+        self.extraction = None; self.model.replace([], [])
+        self.subtitle.setText(str(self.pdf_path)); self.reextract.setEnabled(True); self.progress.setValue(0)
+        self.progress_label.setText("Ready — choose an OCR method or mark table columns")
+        self.activity.clear(); self.activity.append(f"Loaded {self.pdf_path.name}"); self.activity.append("OCR has not started.")
+        self.show_workspace(0)
 
     def start_extraction(self):
         if not self.pdf_path or self._thread:
             return
         modes = ["auto", "lines", "text", "ocr"]; mode = modes[self.mode.currentIndex()]
-        self.progress.show(); self.reextract.setEnabled(False); self.statusBar().showMessage(f"Extracting with {self.mode.currentText()}…")
+        self._set_processing(True, f"Starting {self.mode.currentText()}")
         thread = QThread(self); worker = ExtractWorker(self.pdf_path, mode, self._pdf_password); worker.moveToThread(thread)
         thread.started.connect(worker.run); worker.finished.connect(self.extraction_done); worker.failed.connect(self.extraction_failed)
+        worker.progress.connect(self.on_progress)
         worker.password_required.connect(self.request_pdf_password)
         worker.finished.connect(thread.quit); worker.failed.connect(thread.quit); worker.password_required.connect(thread.quit); thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater); thread.finished.connect(self._thread_finished)
         self._thread = thread; self._worker = worker; thread.start()
 
     def _thread_finished(self):
-        self._thread = None; self.progress.hide(); self.reextract.setEnabled(bool(self.pdf_path))
+        self._thread = None; self.reextract.setEnabled(bool(self.pdf_path))
         if self._retry_after_password:
             self._retry_after_password = False
             if self._retry_guided and self._guided_args:
@@ -438,9 +503,12 @@ class MainWindow(QMainWindow):
                 self.viewer.load_pdf(self.pdf_path, self._pdf_password)
         except Exception:
             pass
-        self.tabs.setCurrentIndex(1)
+        self.on_progress(100, f"Complete — {len(result.rows)} rows extracted")
+        self._set_processing(False)
+        self.show_workspace(1)
 
     def extraction_failed(self, message: str):
+        self._set_processing(False); self.progress_label.setText("Extraction failed"); self.activity.append(f"ERROR: {message}")
         QMessageBox.critical(self, "Extraction failed", message); self.statusBar().showMessage("Extraction failed", 5000)
 
     def request_pdf_password(self, reason: str):
@@ -453,18 +521,45 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Password entry cancelled; no data was extracted.", 5000)
 
-    def start_guided_ocr(self, box, boundaries, page_index: int, all_pages: bool):
+    def start_guided_ocr(self, box, boundaries, page_index: int, all_pages: bool, rotation: int):
         if not self.pdf_path or self._thread:
             return
-        self._guided_args = (box, boundaries, page_index, all_pages)
-        self.progress.show(); self.reextract.setEnabled(False); self.statusBar().showMessage("Running OCR inside the selected table area…")
+        self._guided_args = (box, boundaries, page_index, all_pages, rotation)
+        self._set_processing(True, "Starting guided OCR inside selected columns")
         thread = QThread(self)
-        worker = GuidedOcrWorker(self.pdf_path, box, boundaries, page_index, all_pages, self._pdf_password)
+        worker = GuidedOcrWorker(self.pdf_path, box, boundaries, page_index, all_pages, self._pdf_password, rotation)
         worker.moveToThread(thread); thread.started.connect(worker.run)
         worker.finished.connect(self.extraction_done); worker.failed.connect(self.extraction_failed); worker.password_required.connect(self._guided_password)
+        worker.progress.connect(self.on_progress)
         worker.finished.connect(thread.quit); worker.failed.connect(thread.quit); worker.password_required.connect(thread.quit)
         thread.finished.connect(worker.deleteLater); thread.finished.connect(thread.deleteLater); thread.finished.connect(self._thread_finished)
         self._thread = thread; self._worker = worker; thread.start()
+
+    def _set_processing(self, active: bool, message: str | None = None):
+        self.reextract.setEnabled(not active and bool(self.pdf_path))
+        if active:
+            self.progress.setValue(0); self.activity.clear()
+            if message:
+                self.on_progress(0, message)
+
+    def on_progress(self, percent: int, message: str):
+        self.progress.setValue(percent); self.progress_label.setText(message)
+        timestamp = QTime.currentTime().toString("HH:mm:ss")
+        self.activity.append(f"{timestamp}   {percent:>3}%  {message}")
+        self.activity.verticalScrollBar().setValue(self.activity.verticalScrollBar().maximum())
+        self.statusBar().showMessage(message)
+
+    def show_workspace(self, index: int):
+        self.stack.setCurrentIndex(index)
+        self.page_title.setText("PDF viewer" if index == 0 else "Extracted data")
+        self.pdf_nav.setProperty("active", index == 0); self.data_nav.setProperty("active", index == 1)
+        self.pdf_nav.style().unpolish(self.pdf_nav); self.pdf_nav.style().polish(self.pdf_nav)
+        self.data_nav.style().unpolish(self.data_nav); self.data_nav.style().polish(self.data_nav)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "sidebar"):
+            self.sidebar.setFixedWidth(220 if self.width() < 1100 else 252)
 
     def _guided_password(self, reason: str):
         self._retry_guided = True

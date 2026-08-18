@@ -6,6 +6,9 @@ PDF2Excel Mapper is an offline Windows desktop application for extracting tabula
 
 - Modern native Windows interface with responsive background extraction.
 - Integrated PDF viewer with page navigation.
+- Loading a PDF only opens the preview; OCR starts only after the user chooses **Run OCR** or **Run OCR on selection**.
+- Real page-by-page progress, processing phase messages, and an OCR activity log.
+- PDF zoom from 50% to 200% and clockwise/counter-clockwise rotation.
 - Automatic extraction for text PDFs, borderless tables, and ruled tables.
 - Bundled offline Tesseract OCR for image-only PDFs.
 - Visual table selection: drag the area, place column dividers, then OCR only that geometry.
@@ -19,12 +22,13 @@ PDF2Excel Mapper is an offline Windows desktop application for extracting tabula
 ## Visual table and column selection
 
 1. Open a PDF. The document appears in the **PDF viewer & column selection** tab.
-2. Navigate to a representative page containing the table header or clear transaction rows.
-3. Click **1. Draw table area**, then drag a rectangle around only the table.
-4. Click **2. Add column divider** and click each vertical boundary between columns. Red guides show the resulting columns. The rectangle edges are automatically used as the outer boundaries.
-5. Leave **Apply column layout to all pages** enabled when the same columns repeat throughout the statement. The application keeps the selected column positions while detecting each page's table height.
-6. Click **3. Run OCR on selection**. OCR words are assigned by their geometric position, so blank debit or credit cells remain blank instead of shifting adjacent values.
-7. Review the result in **Extracted data**.
+2. Use the sidebar **Run OCR** button for automatic extraction, or continue with visual selection for precise scanned tables. OCR never starts merely because a file was opened.
+3. Navigate to a representative page containing the table header or clear transaction rows. Zoom or rotate the page when needed.
+4. Click **1. Draw table area**, then drag a rectangle around only the table.
+5. Click **2. Add column divider** and click each vertical boundary between columns. Red guides show the resulting columns. The rectangle edges are automatically used as the outer boundaries.
+6. Leave **Apply column layout to all pages** enabled when the same columns repeat throughout the statement. The application keeps the selected column positions while detecting each page's table height.
+7. Click **3. Run OCR on selection**. OCR words are assigned by their geometric position, so blank debit or credit cells remain blank instead of shifting adjacent values.
+8. Follow actual page progress and phase messages in the sidebar, then review the result in **Extracted data**.
 
 For bank statements, draw the area from the table header/top border through the last visible transaction and place guides at Date, Narration, Reference, Value Date, Withdrawal, Deposit, and Closing Balance boundaries.
 

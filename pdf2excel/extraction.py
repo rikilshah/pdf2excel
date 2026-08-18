@@ -5,8 +5,16 @@ import os
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Callable
 
 from .models import ExtractedTable, ExtractionResult
+
+ProgressCallback = Callable[[int, str], None]
+
+
+def _report(progress: ProgressCallback | None, percent: int, message: str) -> None:
+    if progress:
+        progress(max(0, min(100, percent)), message)
 
 
 class PasswordRequiredError(RuntimeError):
@@ -57,7 +65,8 @@ def _looks_like_header(row: list[str], headers: list[str]) -> bool:
     return sum(norm(a) == norm(b) and bool(norm(a)) for a, b in zip(row, headers)) >= max(1, len(headers) // 2)
 
 
-def _extract_with_pdfplumber(pdf_path: Path, strategy: str = "auto", password: str | None = None) -> tuple[list[ExtractedTable], list[str], int]:
+def _extract_with_pdfplumber(pdf_path: Path, strategy: str = "auto", password: str | None = None,
+                             progress: ProgressCallback | None = None) -> tuple[list[ExtractedTable], list[str], int]:
     try:
         import pdfplumber
     except ImportError as exc:
@@ -72,7 +81,10 @@ def _extract_with_pdfplumber(pdf_path: Path, strategy: str = "auto", password: s
         raise ValueError(f"Unknown extraction strategy: {strategy}")
     try:
         with pdfplumber.open(pdf_path, password=password) as pdf:
+            total_pages = max(1, len(pdf.pages))
             for page_no, page in enumerate(pdf.pages, 1):
+                _report(progress, 10 + round(65 * (page_no - 1) / total_pages),
+                        f"Inspecting page {page_no} of {total_pages} for table geometry")
                 if (page.extract_text() or "").strip():
                     text_pages += 1
                 found = []
@@ -102,12 +114,14 @@ def _extract_with_pdfplumber(pdf_path: Path, strategy: str = "auto", password: s
     return tables, warnings, text_pages
 
 
-def _extract_ocr(pdf_path: Path, password: str | None = None) -> tuple[list[ExtractedTable], list[str]]:
+def _extract_ocr(pdf_path: Path, password: str | None = None,
+                 progress: ProgressCallback | None = None) -> tuple[list[ExtractedTable], list[str]]:
     try:
         import pytesseract
         import pypdfium2 as pdfium
     except ImportError as exc:
         raise RuntimeError("PDF appears scanned; OCR support is not installed. Install with: pip install -e .[ocr]") from exc
+    _report(progress, 5, "Starting bundled Tesseract OCR engine")
     bundle_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
     candidates = [
         bundle_root / "tesseract" / "tesseract.exe",
@@ -125,16 +139,20 @@ def _extract_ocr(pdf_path: Path, password: str | None = None) -> tuple[list[Extr
     except Exception as exc:
         raise RuntimeError("OCR requires Tesseract. Install it or place a portable 'tesseract' folder beside the application executable.") from exc
     document = pdfium.PdfDocument(str(pdf_path), password=password)
+    _report(progress, 10, f"Opened image document with {len(document)} page(s)")
     first_image = document[0].render(scale=300 / 72).to_pil()
     rules = _detect_vertical_rules(first_image)
     if len(rules) >= 3:
-        tables, warnings = _extract_ruled_ocr(document, first_image, rules, pytesseract)
+        _report(progress, 14, f"Detected {len(rules) - 1} ruled columns; using geometric OCR")
+        tables, warnings = _extract_ruled_ocr(document, first_image, rules, pytesseract, progress)
         if tables and sum(len(t.rows) for t in tables):
             warnings.insert(0, "PDF appears to be scanned. Ruled-table OCR was used; verify all extracted data carefully.")
             return tables, warnings
     warnings = ["PDF appears to be scanned. OCR extraction was used; verify all extracted data carefully."]
     tables: list[ExtractedTable] = []
     for page_no, page in enumerate(document, 1):
+        _report(progress, 15 + round(70 * (page_no - 1) / max(1, len(document))),
+                f"Recognizing page {page_no} of {len(document)}")
         image = first_image if page_no == 1 else page.render(scale=300 / 72).to_pil()
         data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, config="--psm 6")
         lines: dict[tuple[int, int, int], list[tuple[int, str]]] = {}
@@ -244,11 +262,14 @@ def _table_vertical_span(image, rules: list[int]) -> tuple[int, int] | None:
     return max(runs, key=lambda run: run[1] - run[0]) if runs else None
 
 
-def _extract_ruled_ocr(document, first_image, rules: list[int], pytesseract) -> tuple[list[ExtractedTable], list[str]]:
+def _extract_ruled_ocr(document, first_image, rules: list[int], pytesseract,
+                       progress: ProgressCallback | None = None) -> tuple[list[ExtractedTable], list[str]]:
     tables: list[ExtractedTable] = []
     warnings: list[str] = []
     canonical_headers: list[str] | None = None
     for page_no, page in enumerate(document, 1):
+        _report(progress, 15 + round(70 * (page_no - 1) / max(1, len(document))),
+                f"OCR page {page_no} of {len(document)}: locating rows in {len(rules) - 1} columns")
         image = first_image if page_no == 1 else page.render(scale=300 / 72).to_pil()
         # Scale the first-page rules if a page has a slightly different bitmap width.
         scaled_rules = [round(x * image.width / first_image.width) for x in rules]
@@ -324,8 +345,10 @@ def _ocr_rows_by_rules(image, rules: list[int], span: tuple[int, int], pytessera
 
 def extract_selected_ocr(pdf_path: Path, box: tuple[float, float, float, float],
                          boundaries: list[float], page_index: int = 0, all_pages: bool = False,
-                         password: str | None = None) -> ExtractionResult:
+                         password: str | None = None, progress: ProgressCallback | None = None,
+                         rotation: int = 0) -> ExtractionResult:
     """OCR only a user-selected normalized page rectangle using explicit column boundaries."""
+    _report(progress, 2, "Validating selected table geometry")
     _check_password(pdf_path, password)
     if len(boundaries) < 2 or any(not 0 <= value <= 1 for value in boundaries):
         raise ValueError("At least two valid column boundaries are required.")
@@ -341,13 +364,18 @@ def extract_selected_ocr(pdf_path: Path, box: tuple[float, float, float, float],
     _configure_tesseract(pytesseract)
     document = pdfium.PdfDocument(str(pdf_path), password=password)
     indexes = range(len(document)) if all_pages else [page_index]
+    selected_indexes = list(indexes)
     tables: list[ExtractedTable] = []
     warnings = ["User-guided region OCR was used; verify extracted values carefully."]
     canonical_headers: list[str] | None = None
-    for index in indexes:
+    for position, index in enumerate(selected_indexes, 1):
+        _report(progress, 10 + round(75 * (position - 1) / max(1, len(selected_indexes))),
+                f"OCR page {position} of {len(selected_indexes)} inside selected columns")
         if index < 0 or index >= len(document):
             raise ValueError("Selected page is outside the PDF page range.")
         image = document[index].render(scale=300 / 72).to_pil()
+        if rotation % 360:
+            image = image.rotate(-(rotation % 360), expand=True)
         x_rules = sorted(set(round(value * image.width) for value in boundaries))
         selected_span = (round(top * image.height), round(bottom * image.height))
         # When applying guides across pages, retain user-defined columns but let
@@ -367,30 +395,43 @@ def extract_selected_ocr(pdf_path: Path, box: tuple[float, float, float, float],
         for table in tables:
             if len(table.headers) == len(canonical_headers):
                 table.headers = canonical_headers[:]
+    _report(progress, 92, f"Assembled {sum(len(t.rows) for t in tables)} row(s) from selected area")
     return _result_from_tables(tables, warnings, used_ocr=True)
 
 
-def extract_pdf(pdf_path: Path, allow_ocr: bool = True, mode: str = "auto", password: str | None = None) -> ExtractionResult:
+def extract_pdf(pdf_path: Path, allow_ocr: bool = True, mode: str = "auto", password: str | None = None,
+                progress: ProgressCallback | None = None) -> ExtractionResult:
     if not pdf_path.is_file():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    _report(progress, 1, "Validating PDF and password")
     _check_password(pdf_path, password)
     if mode == "ocr":
-        tables, warnings = _extract_ocr(pdf_path, password)
+        tables, warnings = _extract_ocr(pdf_path, password, progress)
         if not tables:
             raise RuntimeError("Unable to extract tables from the PDF using OCR.")
         text_pages, used_ocr = 0, True
     else:
-        tables, warnings, text_pages = _extract_with_pdfplumber(pdf_path, mode, password)
+        inspection_progress = progress
+        if mode == "auto" and progress is not None:
+            inspection_progress = lambda percent, message: _report(progress, 3 + round(percent * 0.28), message)
+        tables, warnings, text_pages = _extract_with_pdfplumber(pdf_path, mode, password, inspection_progress)
         used_ocr = False
     if not tables and text_pages == 0 and allow_ocr:
-        tables, ocr_warnings = _extract_ocr(pdf_path, password)
+        _report(progress, 28, "No text table found; switching to OCR")
+        ocr_progress = progress
+        if mode == "auto" and progress is not None:
+            ocr_progress = lambda percent, message: _report(progress, 28 + round(percent * 0.64), message)
+        tables, ocr_warnings = _extract_ocr(pdf_path, password, ocr_progress)
         warnings.extend(ocr_warnings)
         used_ocr = True
     if not tables:
         detail = " PDF appears image-based; OCR is required." if text_pages == 0 else " The table structure may be unsupported."
         raise RuntimeError("Unable to extract tables from the PDF." + detail)
 
-    return _result_from_tables(tables, warnings, used_ocr)
+    _report(progress, 92, "Normalizing columns and validating extracted rows")
+    result = _result_from_tables(tables, warnings, used_ocr)
+    _report(progress, 100, f"Complete: {len(result.rows)} row(s), {len(result.columns)} column(s)")
+    return result
 
 
 def _result_from_tables(tables: list[ExtractedTable], warnings: list[str], used_ocr: bool) -> ExtractionResult:
