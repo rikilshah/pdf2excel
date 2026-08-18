@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.1
+
+- Fixed adjacent bank-statement transactions being merged when OCR added punctuation to a date.
+- Added a regression test for transaction dates containing trailing OCR punctuation.
+
 ## 1.3.0
 
 - Loading a PDF now displays the document without starting OCR.

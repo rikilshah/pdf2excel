@@ -9,7 +9,7 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
 from pypdf import PdfReader, PdfWriter
 
 from pdf2excel.export import export_xlsx
-from pdf2excel.extraction import InvalidPasswordError, PasswordRequiredError, extract_pdf, extract_selected_ocr
+from pdf2excel.extraction import InvalidPasswordError, PasswordRequiredError, _ocr_rows_by_rules, extract_pdf, extract_selected_ocr
 from pdf2excel.gui import DataModel
 from pdf2excel.corrections import apply_instruction
 from pdf2excel.mapping import MappingStore, apply_mapping, suggest_mapping
@@ -135,3 +135,28 @@ def test_user_guided_region_ocr_and_editable_headers(tmp_path: Path):
     assert result.rows and result.rows[0][result.columns[0]] == "01/03/26"
     model = DataModel(); model.replace(result.columns, result.rows); model.rename_column(0, "Transaction Date")
     assert model.columns[0] == "Transaction Date" and model.rows[0]["Transaction Date"] == "01/03/26"
+
+
+def test_ruled_ocr_treats_date_with_trailing_ocr_punctuation_as_new_row():
+    class FakeTesseract:
+        class Output:
+            DICT = object()
+
+        @staticmethod
+        def image_to_data(_image, **_kwargs):
+            texts = ["Date", "Narration", "Withdrawal", "Closing", "28/07/25", "IMPS-ONE", "10,000.00", "348,780",
+                     "28/07/25.", "IMPS-TWO", "5.90", "348,774"]
+            lefts = [10, 120, 430, 620] * 3
+            tops = [10] * 4 + [60] * 4 + [100] * 4
+            return {
+                "text": texts, "conf": [95] * len(texts), "left": lefts, "top": tops,
+                "width": [60] * len(texts), "height": [20] * len(texts),
+                "block_num": [1] * len(texts), "par_num": [1] * len(texts),
+                "line_num": [1] * 4 + [2] * 4 + [3] * 4,
+            }
+
+    image = Image.new("RGB", (800, 160), "white")
+    _, rows = _ocr_rows_by_rules(image, [0, 100, 400, 600, 800], (0, 150), FakeTesseract())
+    assert len(rows) == 2
+    assert rows[0] == ["28/07/25", "IMPS-ONE", "10,000.00", "348,780"]
+    assert rows[1] == ["28/07/25", "IMPS-TWO", "5.90", "348,774"]

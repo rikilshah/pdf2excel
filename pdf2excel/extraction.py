@@ -315,11 +315,11 @@ def _ocr_rows_by_rules(image, rules: list[int], span: tuple[int, int], pytessera
                 key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
                 lines.setdefault(key, []).append((center_y, column, text))
         line_cells: list[tuple[int, list[str]]] = []
-        for words in lines.values():
+        for line_words in lines.values():
             cells = [""] * (len(rules) - 1)
-            for _, column, text in sorted(words, key=lambda item: (item[1], item[0])):
+            for _, column, text in sorted(line_words, key=lambda item: (item[1], item[0])):
                 cells[column] = (cells[column] + " " + text).strip()
-            line_cells.append((round(sum(w[0] for w in words) / len(words)), cells))
+            line_cells.append((round(sum(word[0] for word in line_words) / len(line_words)), cells))
         line_cells.sort(key=lambda item: item[0])
         header_index = next((i for i, (_, cells) in enumerate(line_cells)
                              if sum(any(term in cell.lower() for term in ("date", "narration", "withdraw", "deposit", "closing")) for cell in cells) >= 2), None)
@@ -331,7 +331,9 @@ def _ocr_rows_by_rules(image, rules: list[int], span: tuple[int, int], pytessera
             headers = canonical_headers or [f"Column {i + 1}" for i in range(len(rules) - 1)]
         rows: list[list[str]] = []
         for _, cells in line_cells:
-            first = cells[0].replace(" ", "")
+            # OCR often adds punctuation immediately before or after an otherwise
+            # valid date. Normalize only edge noise; preserve internal separators.
+            first = cells[0].replace(" ", "").strip("|,;:._-[]()")
             if date_pattern.match(first):
                 cells[0] = first
                 rows.append(cells)
